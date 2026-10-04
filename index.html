@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Ziggurat Pachinko — prototype</title>
+<style>
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; }
+html, body { margin: 0; height: 100%; overflow: hidden; background: #0d0a14; color: #f3e7c9; font-family: Georgia, "Times New Roman", serif; }
+body { touch-action: manipulation; }
+#app { position: relative; width: 100%; max-width: 520px; height: 100%; margin: 0 auto; overflow: hidden; display: flex; flex-direction: column; }
+#top { position: relative; z-index: 5; flex: none; height: 30px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; font: 600 12px/1 Georgia; letter-spacing: .5px; text-transform: uppercase; color: #d9c79a;
+  background: linear-gradient(180deg, #1f3a8a, #142a66 60%, #0c1a44); border-bottom: 2px solid #d4a63a; box-shadow: 0 2px 8px rgba(0,0,0,.6); }
+#top b { color: #ffe39a; font-size: 14px; letter-spacing: 0; text-shadow: 0 1px 0 #000; }
+#gard { display: none; color: #1a2a10; background: linear-gradient(180deg, #c8f0a0, #6fbf4a); padding: 2px 6px; border-radius: 3px; font-size: 10px; letter-spacing: 1px; }
+body.boost #gard { display: inline-block; }
+#cv { flex: 1; width: 100%; min-height: 0; display: block; }
+#toast { display: none; position: absolute; left: 50%; top: 40px; transform: translateX(-50%); z-index: 40; background: rgba(12,20,50,.95); border: 1px solid #d4a63a; border-radius: 4px; padding: 6px 12px; font-size: 13px; white-space: nowrap; }
+</style>
+</head>
+<body data-mode="" data-busy="1">
+<div id="app">
+  <div id="top"><span>Balance <b id="bal">0</b></span><span id="gard">GARDENS 5</span><span>Win <b id="win">0</b></span></div>
+  <canvas id="cv"></canvas>
+  <div id="toast"></div>
+</div>
+<script>
+// ==LOGIC-START== (pure game logic, shared by the page and sim.js — no DOM here)
+var CONFIG = {
+  STORAGE_KEY: 'pachinko_ziggurat_proto_v1',
+  START_BALANCE: 10000, BALLS: 100, BALL_VALUE: 1, BET: 100,       // one round = 100 balls = 100 credits
+  // slot kinds: n = credits per ball (0 = empty), 'G' = gate (ball rises to the next tier), 'J' = the tier's jackpot
+  // jackpots pay a multiple of the total bet: Mini 10x, Minor 30x, Major 150x, Grand 1000x
+  JP: [{ name: 'MINI', x: 10 }, { name: 'MINOR', x: 30 }, { name: 'MAJOR', x: 150 }, { name: 'GRAND', x: 1000 }],
+  TIERS: [
+    { name: 'I',   slots: [5, 2, 1, 0, 'G', 0, 1, 2, 'J'],             w: [1200, 3075, 14000, 31925, 800, 31925, 14000, 3075, 2] },
+    { name: 'II',  slots: [150, 40, 20, 0, 'G', 0, 20, 40, 'J'],        w: [4000, 11000, 16000, 12000, 6000, 12000, 16000, 11000, 80] },
+    { name: 'III', slots: [1500, 400, 150, 0, 'G', 0, 150, 400, 'J'],   w: [2500, 9000, 16000, 10000, 12000, 10000, 16000, 9000, 280] },
+    { name: 'IV',  slots: [5000, 1500, 500, 200, 'J', 200, 500, 1500, 3000], w: [3000, 10000, 18000, 15000, 250, 15000, 18000, 10000, 5000] }
+  ],
+  // "Hanging Gardens" (kakuhen-style): reaching tier IV boosts the next N rounds: tier I gate weight x BOOST (taken from the empty slots)
+  KAKUHEN: { ROUNDS: 5, GATE_BOOST: 2.5 },
+  // colour hint shown on a tier's gate (or Grand) when balls arrive: weights [blue, red, gold] depending on whether a ball will pass it
+  HINT_PASS: [15, 35, 50], HINT_FAIL: [78, 19, 3]
+};
+var PZ = (function () {
+  var C = CONFIG;
+  function mulberry32(a) { a = a >>> 0; return { next: function () { a = (a + 0x6D2B79F5) >>> 0; var t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; } }; }
+  function wpick(rng, w, sum) { var r = rng.next() * sum; for (var i = 0; i < w.length; i++) { r -= w[i]; if (r < 0) return i; } return w.length - 1; }
+  function tierWeights(t, boosted) {
+    var T = C.TIERS[t], w = T.w.slice();
+    if (t === 0 && boosted) { var g = T.slots.indexOf('G'), add = w[g] * (C.KAKUHEN.GATE_BOOST - 1); w[g] += add; // take it evenly from the empty slots
+      var em = []; T.slots.forEach(function (s, i) { if (s === 0) em.push(i); }); em.forEach(function (i) { w[i] -= add / em.length; }); }
+    return w;
+  }
+  var SUMS = null;
+  // forceTier (cheat): make sure at least one ball reaches that tier
+  function playRound(rng, boosted, forceTier) {
+    var W = [0, 1, 2, 3].map(function (t) { return tierWeights(t, boosted); }), S = W.map(function (w) { return w.reduce(function (a, b) { return a + b; }, 0); });
+    var balls = [], total = 0, perTier = [0, 0, 0, 0], jp = [], top = 0, stageBalls = [[], [], [], []];
+    for (var b = 0; b < C.BALLS; b++) {
+      var path = [], t = 0, win = 0, kind = 'credit';
+      while (true) {
+        var s = wpick(rng, W[t], S[t]), v = C.TIERS[t].slots[s]; path.push(s); stageBalls[t].push(b);
+        if (v === 'G') { t++; continue; }
+        if (v === 'J') { win = C.JP[t].x * C.BET; kind = 'jp'; jp.push(C.JP[t].name); }
+        else win = v * C.BALL_VALUE;
+        break;
+      }
+      if (t > top) top = t; total += win; perTier[t] += kind === 'jp' ? 0 : win;
+      balls.push({ path: path, win: win, tier: t, kind: kind });
+    }
+    if (forceTier && top < forceTier) { // cheat: re-route the first balls through the gates until the forced tier is reached
+      for (var k = 0; k < forceTier; k++) { var bb = balls[k], g; total -= bb.win; if (bb.kind === 'jp') jp.splice(jp.indexOf(C.JP[bb.tier].name), 1); else perTier[bb.tier] -= bb.win;
+        var p = []; for (var tt = 0; tt < forceTier; tt++) { g = C.TIERS[tt].slots.indexOf('G'); p.push(g); }
+        var s2 = wpick(rng, W[forceTier], S[forceTier]), v2 = C.TIERS[forceTier].slots[s2]; while (v2 === 'G') { s2 = wpick(rng, W[forceTier], S[forceTier]); v2 = C.TIERS[forceTier].slots[s2]; }
+        p.push(s2); bb.path = p; bb.tier = forceTier; if (v2 === 'J') { bb.win = C.JP[forceTier].x * C.BET; bb.kind = 'jp'; jp.push(C.JP[forceTier].name); } else { bb.win = v2; bb.kind = 'credit'; perTier[forceTier] += v2; }
+        total += bb.win; }
+      top = forceTier; stageBalls = [[], [], [], []]; balls.forEach(function (bb, i) { bb.path.forEach(function (_, tt) { stageBalls[tt].push(i); }); });
+    }
+    // colour hints per stage (tiers II-IV): does any ball pass this tier's gate (or hit the Grand)?
+    var hints = [null, null, null, null];
+    for (var t2 = 1; t2 < 4; t2++) { if (!stageBalls[t2].length) continue;
+      var pass = t2 < 3 ? stageBalls[t2].some(function (i) { return balls[i].path.length > t2 + 1; }) : balls.some(function (bb) { return bb.tier === 3 && bb.kind === 'jp'; });
+      hints[t2] = ['blue', 'red', 'gold'][wpick(rng, pass ? C.HINT_PASS : C.HINT_FAIL, 100)]; }
+    return { balls: balls, total: total, perTier: perTier, jp: jp, top: top, hints: hints, boosted: !!boosted, kakuhenStart: top >= 3 };
+  }
+  return { mulberry32: mulberry32, playRound: playRound, tierWeights: tierWeights };
+})();
+if (typeof module !== 'undefined') module.exports = { CONFIG: CONFIG, PZ: PZ };
+// ==LOGIC-END==
+
+</script>
+<script>
+// ======================= UI (canvas) =======================
+(function () {
+  var C = CONFIG, $ = function (id) { return document.getElementById(id); };
+  var qs = new URLSearchParams(location.search);
+  var SEED = qs.has('seed') ? (parseInt(qs.get('seed'), 10) || 0) : null;
+  var rng = PZ.mulberry32(SEED !== null ? SEED : (Math.random() * 4294967296) >>> 0);
+  var vr = PZ.mulberry32(SEED !== null ? SEED * 7 + 3 : (Math.random() * 4294967296) >>> 0); // visual randomness (paths) — separate from the outcome RNG
+  var SP = qs.get('turbo') === '1' ? 0.55 : 1;
+  var FORCE = qs.has('tier') ? Math.max(0, Math.min(3, (parseInt(qs.get('tier'), 10) || 1) - 1)) : 0;
+  var S = { balance: C.START_BALANCE, lastWin: 0, kak: 0, pending: null, mode: '', busy: false, round: null, rounds: 0 };
+  if (qs.get('gardens') === '1') S.kak = C.KAKUHEN.ROUNDS;
+  function fm(x) { return Math.round(x).toLocaleString('en-US'); }
+  function save() { try { localStorage.setItem(C.STORAGE_KEY, JSON.stringify({ balance: S.balance, kak: S.kak, pending: S.pending })); } catch (e) {} }
+  function load() {
+    try { var d = JSON.parse(localStorage.getItem(C.STORAGE_KEY) || 'null');
+      if (d) { S.balance = +d.balance || 0; if (!qs.has('gardens')) S.kak = +d.kak || 0;
+        if (d.pending) { S.balance += d.pending.win; S.kak = d.pending.kak; if (d.pending.win > 0) setTimeout(function () { toast('Unfinished round credited: +' + fm(d.pending.win)); }, 400); } } } catch (e) {}
+    S.pending = null; save();
+  }
+  function toast(t) { var e = $('toast'); e.textContent = t; e.style.display = 'block'; clearTimeout(toast.t); toast.t = setTimeout(function () { e.style.display = 'none'; }, 2600); }
+  function setMode(m) { S.mode = m; document.body.dataset.mode = m; }
+  function setBusy(b) { S.busy = b; document.body.dataset.busy = b ? '1' : '0'; }
+  function renderTop(b, w) { $('bal').textContent = fm(b === undefined ? S.balance : b); $('win').textContent = fm(w === undefined ? S.lastWin : w);
+    document.body.classList.toggle('boost', S.kak > 0); $('gard').textContent = 'GARDENS ' + S.kak; }
+
+  // ---------- canvas & geometry ----------
+  var cv = $('cv'), ctx = cv.getContext('2d'), W = 0, H = 0, DPR = 1, G = [], BG = [], SPRITE = null, R = 12;
+  function geom() {
+    G = [];
+    for (var t = 0; t < 4; t++) {
+      var m = Math.round(W * (0.035 + 0.045 * t)), fw = W - 2 * m, dx = fw / 9, rowY0 = H * 0.175, rowY1 = H * 0.715, dy = (rowY1 - rowY0) / (R - 1);
+      var g = { m: m, X0: m, fw: fw, dx: dx, dy: dy, rowY: [], pegR: Math.max(1.8, Math.min(dx * 0.07, 3.6)), ballR: Math.max(2.6, Math.min(dx * 0.15, dy * 0.2, 6)),
+        head: H * 0.085, chuteY: H * 0.11, slotTop: H * 0.76, slotBot: H * 0.885, slotY: H * 0.85, labelY: H * 0.918, band: H * 0.948 };
+      for (var r = 0; r < R; r++) g.rowY.push(rowY0 + r * dy);
+      G.push(g);
+    }
+  }
+  function cx(t, h) { return G[t].X0 + h * G[t].dx / 2; }
+  function cy(t, r) { var g = G[t]; return g.rowY[r] - g.pegR - g.ballR * 0.85; }
+  function wy(t, y) { return (3 - t) * H + y; }
+  function slotX(t, s) { return G[t].X0 + (s + 0.5) * G[t].dx; }
+  function mkCanvas(w, h) { var c = document.createElement('canvas'); c.width = Math.round(w * DPR); c.height = Math.round(h * DPR); var x = c.getContext('2d'); x.setTransform(DPR, 0, 0, DPR, 0, 0); return [c, x]; }
+  function resize() {
+    W = cv.clientWidth; H = cv.clientHeight; DPR = Math.min(2, window.devicePixelRatio || 1);
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR); ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    geom(); BG = [0, 1, 2, 3].map(drawTierBG);
+    var br = G[0].ballR, sp = mkCanvas(br * 2 + 2, br * 2 + 2), x = sp[1]; var gr = x.createRadialGradient(br * 0.7, br * 0.6, br * 0.1, br + 1, br + 1, br);
+    gr.addColorStop(0, '#ffffff'); gr.addColorStop(0.35, '#d9dde6'); gr.addColorStop(0.8, '#7d8696'); gr.addColorStop(1, '#3b414d');
+    x.fillStyle = gr; x.beginPath(); x.arc(br + 1, br + 1, br, 0, 7); x.fill(); SPRITE = sp[0];
+    if (S.round && S.round.tl) rebuildAfterResize();
+  }
+  // ---------- static tier art ----------
+  function seeded(n) { var r = PZ.mulberry32(n); return function () { return r.next(); }; }
+  function drawTierBG(t) {
+    var c = mkCanvas(W, H), x = c[1], g = G[t], rnd = seeded(91 + t * 17), wt = Math.max(9, Math.round(W * 0.03));
+    // sky behind the ziggurat: deep night at the bottom tier -> dawn gold at the top
+    var skies = [['#0b1028', '#141c44'], ['#141a46', '#2c2c6c'], ['#3a2c6a', '#8a4e6a'], ['#d08458', '#f6cc84']];
+    var sk = x.createLinearGradient(0, 0, 0, H); sk.addColorStop(0, skies[t][1]); sk.addColorStop(1, skies[t][0]); x.fillStyle = sk; x.fillRect(0, 0, W, H);
+    if (t === 3) { var sun = x.createRadialGradient(W * 0.5, H * 0.03, 4, W * 0.5, H * 0.03, W * 0.6); sun.addColorStop(0, 'rgba(255,246,210,.95)'); sun.addColorStop(0.25, 'rgba(255,220,150,.45)'); sun.addColorStop(1, 'rgba(255,200,120,0)'); x.fillStyle = sun; x.fillRect(0, 0, W, H); }
+    if (t < 3) { x.fillStyle = 'rgba(255,255,255,' + (0.7 - t * 0.2) + ')'; for (var i = 0; i < 30; i++) { var sx0 = rnd() < 0.5 ? rnd() * g.m : W - rnd() * g.m; x.fillRect(sx0, rnd() * H * 0.9, 1.2, 1.2); } }
+    // distant city silhouette at the side gaps (upper tiers only, you look out over Babylon)
+    if (t >= 1) { x.fillStyle = ['', 'rgba(10,12,40,.55)', 'rgba(40,20,60,.45)', 'rgba(140,70,60,.35)'][t];
+      for (var side = 0; side < 2; side++) { var bx0 = side ? W - g.m : 0; for (var b = 0; b < 6; b++) { var bw = 4 + rnd() * 10, bh = H * (0.03 + rnd() * 0.06), bxx = bx0 + rnd() * (g.m - bw); x.fillRect(bxx, H * 0.96 - bh, bw, bh); } } }
+    // sandstone walls of this tier (constant thickness; upper tiers are narrower, so sky shows outside)
+    function sandRect(x0, y0, w, h) { var sg = x.createLinearGradient(x0, 0, x0 + w, 0); sg.addColorStop(0, '#a98450'); sg.addColorStop(0.45, '#dcbd82'); sg.addColorStop(1, '#9c7642'); x.fillStyle = sg; x.fillRect(x0, y0, w, h);
+      x.strokeStyle = 'rgba(80,50,20,.33)'; x.lineWidth = 1; for (var yy = y0 + 6; yy < y0 + h; yy += 9) { x.beginPath(); x.moveTo(x0, yy); x.lineTo(x0 + w, yy); x.stroke(); var off = (Math.floor((yy - y0) / 9) % 2) * 7; for (var xx = x0 + off; xx < x0 + w; xx += 14) { x.beginPath(); x.moveTo(xx, yy - 9); x.lineTo(xx, Math.min(yy, y0 + h)); x.stroke(); } } }
+    var wl = Math.max(0, g.m - wt), wTop = g.head * 0.35;
+    sandRect(wl, wTop, wt + 1, H - wTop); sandRect(W - g.m - 1, wTop, wt + 1, H - wTop);
+    // crenellations on the wall tops
+    x.fillStyle = '#c9a66c'; for (var cr = 0; cr < 2; cr++) { var cx0 = cr ? W - g.m - 1 : wl; x.fillRect(cx0, wTop - 6, wt * 0.4, 6); x.fillRect(cx0 + wt * 0.6 + 1, wTop - 6, wt * 0.4, 6); }
+    // field: lapis glazed bricks
+    var fg = x.createLinearGradient(0, g.head, 0, g.band); fg.addColorStop(0, ['#1c3c90', '#1f429c', '#2446a2', '#2c50ae'][t]); fg.addColorStop(1, '#0c1c4c'); x.fillStyle = fg; x.fillRect(g.m, g.head, g.fw, g.band - g.head);
+    x.lineWidth = 1; var bh2 = 11, bw2 = 22;
+    for (var row = 0, yy2 = g.head; yy2 < g.band; yy2 += bh2, row++) { x.strokeStyle = 'rgba(4,10,40,.35)'; x.beginPath(); x.moveTo(g.m, yy2); x.lineTo(W - g.m, yy2); x.stroke();
+      for (var xx2 = g.m + (row % 2) * bw2 / 2; xx2 < W - g.m; xx2 += bw2) { x.beginPath(); x.moveTo(xx2, yy2); x.lineTo(xx2, Math.min(g.band, yy2 + bh2)); x.stroke();
+        if (rnd() < 0.25) { x.fillStyle = 'rgba(140,180,255,' + (0.04 + rnd() * 0.06) + ')'; x.fillRect(xx2 + 1, yy2 + 1, bw2 - 2, bh2 - 2); } } }
+    // Ishtar-gate style side borders: white/yellow rosettes running down both edges of the field
+    function rosette(rx, ry, rr, petal, core) { x.fillStyle = petal; for (var p = 0; p < 8; p++) { var a = p * Math.PI / 4; x.beginPath(); x.ellipse(rx + Math.cos(a) * rr * 0.55, ry + Math.sin(a) * rr * 0.55, rr * 0.42, rr * 0.2, a, 0, 7); x.fill(); } x.fillStyle = core; x.beginPath(); x.arc(rx, ry, rr * 0.25, 0, 7); x.fill(); }
+    x.strokeStyle = '#d4a63a'; x.lineWidth = 2; x.strokeRect(g.m + 1, g.head + 1, g.fw - 2, g.band - g.head - 2);
+    // header band: glazed bricks, title row + rosette frieze
+    var hb = x.createLinearGradient(0, 0, 0, g.head); hb.addColorStop(0, '#2a4cb0'); hb.addColorStop(1, '#14296a'); x.fillStyle = hb; x.fillRect(g.m, 0, g.fw, g.head);
+    x.fillStyle = '#d4a63a'; x.fillRect(g.m, g.head - 3, g.fw, 3); x.fillRect(g.m, 0, g.fw, 2); x.fillRect(g.m, g.head * 0.62, g.fw, 1);
+    var nros = Math.max(6, Math.floor(g.fw / 22)); for (var i2 = 0; i2 < nros; i2++) rosette(g.m + (i2 + 0.5) * g.fw / nros, g.head * 0.81, Math.min(9, g.head * 0.16), i2 % 2 ? '#f6f0dc' : '#f0c95a', '#c8902a');
+    // chute (where the waterfall enters)
+    x.fillStyle = '#081232'; x.beginPath(); x.moveTo(W / 2 - g.dx * 1.8, g.head); x.lineTo(W / 2 + g.dx * 1.8, g.head); x.lineTo(W / 2 + g.dx * 1.0, g.head + 9); x.lineTo(W / 2 - g.dx * 1.0, g.head + 9); x.fill();
+    x.fillStyle = '#d4a63a'; x.fillRect(W / 2 - g.dx * 1.0, g.head + 8, g.dx * 2, 2);
+    // hanging gardens: vines from the wall tops and the header
+    function leaf(px, py) { x.fillStyle = rnd() < 0.5 ? '#4f8f36' : '#72b24c'; x.beginPath(); x.ellipse(px, py, 3.4, 1.8, rnd() * 3, 0, 7); x.fill(); if (rnd() < 0.08) { x.fillStyle = rnd() < 0.5 ? '#ff8fc0' : '#fff0a0'; x.beginPath(); x.arc(px + 2, py, 1.7, 0, 7); x.fill(); } }
+    function vine(x0, y0, len, dir) { x.strokeStyle = '#33602a'; x.lineWidth = 1.3; x.beginPath(); x.moveTo(x0, y0); var px = x0, py = y0, pts = [];
+      for (var k = 0; k < len; k += 6) { px += (rnd() - 0.5) * 2.5 + dir * 0.25; py += 6; x.lineTo(px, py); pts.push([px, py]); } x.stroke(); pts.forEach(function (q) { leaf(q[0] + (rnd() - 0.5) * 6, q[1]); }); }
+    for (var v = 0; v < 4; v++) { vine(wl + rnd() * wt, wTop, H * (0.10 + rnd() * 0.22), 1); vine(W - g.m + rnd() * wt, wTop, H * (0.10 + rnd() * 0.22), -1); }
+    for (var v2 = 0; v2 < 7; v2++) { var vx = g.m + 6 + rnd() * (g.fw - 12); if (Math.abs(vx - W / 2) < g.dx * 1.6) continue; vine(vx, g.head, H * (0.015 + rnd() * 0.035), 0); }
+    // pegs: gold studs
+    for (var r = 0; r < R; r++) { var odd = r % 2 === 1; for (var h = odd ? 2 : 1; h <= (odd ? 16 : 17); h += 2) { var px = cx(t, h), py = g.rowY[r];
+      x.fillStyle = 'rgba(0,0,20,.35)'; x.beginPath(); x.arc(px + 0.8, py + 1.2, g.pegR, 0, 7); x.fill();
+      var pg = x.createRadialGradient(px - g.pegR * 0.4, py - g.pegR * 0.4, 0.3, px, py, g.pegR); pg.addColorStop(0, '#fff6c8'); pg.addColorStop(0.5, '#e2b24a'); pg.addColorStop(1, '#7a5214'); x.fillStyle = pg; x.beginPath(); x.arc(px, py, g.pegR, 0, 7); x.fill(); } }
+    // slots: arched niches
+    var T = C.TIERS[t], sh = g.slotBot - g.slotTop;
+    for (var s = 0; s < 9; s++) { var sx = g.X0 + s * g.dx, k = T.slots[s], aw = g.dx - 4, ar = aw / 2, ay = g.slotTop + ar;
+      var col = k === 'G' ? ['#2a5ad0', '#0a1c5a'] : k === 'J' ? ['#c0392b', '#5a0f0f'] : k === 0 ? ['#141a34', '#070b1c'] : ['#b8894a', '#4a3216'];
+      var sg2 = x.createLinearGradient(0, g.slotTop, 0, g.slotBot); sg2.addColorStop(0, col[0]); sg2.addColorStop(1, col[1]); x.fillStyle = sg2;
+      x.beginPath(); x.moveTo(sx + 2, g.slotBot); x.lineTo(sx + 2, ay); x.arc(sx + 2 + ar, ay, ar, Math.PI, 0); x.lineTo(sx + 2 + aw, g.slotBot); x.closePath(); x.fill();
+      if (k === 'G') { x.strokeStyle = '#9cc8ff'; x.lineWidth = 1.5; x.stroke(); x.fillStyle = 'rgba(160,210,255,.25)'; x.beginPath(); x.arc(sx + 2 + ar, ay, ar * 0.55, 0, 7); x.fill(); }
+      if (k === 'J') { x.strokeStyle = '#ffd36a'; x.lineWidth = 1.5; x.stroke(); rosette(sx + 2 + ar, ay, ar * 0.8, '#ffd36a', '#fff3c0'); } }
+    for (var s2 = 0; s2 <= 9; s2++) { var bx = g.X0 + s2 * g.dx; var pg2 = x.createLinearGradient(bx - 2, 0, bx + 2, 0); pg2.addColorStop(0, '#8a6020'); pg2.addColorStop(0.5, '#ffe08a'); pg2.addColorStop(1, '#8a6020'); x.fillStyle = pg2; x.fillRect(bx - 1.5, g.slotTop - 8, 3, sh + 8);
+      x.fillStyle = '#ffe9a8'; x.beginPath(); x.arc(bx, g.slotTop - 8, 2.2, 0, 7); x.fill(); }
+    x.fillStyle = '#d4a63a'; x.fillRect(g.m, g.slotBot, g.fw, 2);
+    // slot labels
+    x.textAlign = 'center'; x.textBaseline = 'middle';
+    for (var s3 = 0; s3 < 9; s3++) { var k3 = T.slots[s3], lx = slotX(t, s3), fs = Math.max(8, Math.min(14, g.dx * 0.32));
+      if (k3 === 'G') { x.font = '700 ' + Math.max(7, fs * 0.72) + 'px Georgia'; x.fillStyle = '#9cc8ff'; x.fillText('GATE', lx, g.labelY); }
+      else if (k3 === 'J') { x.font = '800 ' + Math.max(7, fs * 0.66) + 'px Georgia'; x.fillStyle = '#ffd36a'; x.fillText(C.JP[t].name, lx, g.labelY - fs * 0.45); x.fillText(short(C.JP[t].x * C.BET), lx, g.labelY + fs * 0.5); }
+      else if (k3 === 0) { x.font = '600 ' + fs + 'px Georgia'; x.fillStyle = 'rgba(200,190,160,.35)'; x.fillText('–', lx, g.labelY); }
+      else { x.font = '800 ' + fs + 'px Georgia'; x.fillStyle = '#ffe9a8'; x.fillText(short(k3), lx, g.labelY); } }
+    // terrace of the wider tier below (tier I: the ground / city wall), with garden planters
+    var bb = x.createLinearGradient(0, g.band, 0, H); bb.addColorStop(0, '#dcbd82'); bb.addColorStop(1, '#8a6a3e'); x.fillStyle = bb; x.fillRect(0, g.band, W, H - g.band);
+    x.fillStyle = '#2547a8'; x.fillRect(0, g.band + (H - g.band) * 0.42, W, (H - g.band) * 0.3); x.fillStyle = '#d4a63a'; x.fillRect(0, g.band, W, 2); x.fillRect(0, g.band + (H - g.band) * 0.42, W, 1);
+    var nr2 = Math.floor(W / 26); for (var i3 = 0; i3 < nr2; i3++) rosette((i3 + 0.5) * W / nr2, g.band + (H - g.band) * 0.57, Math.min(7, (H - g.band) * 0.13), '#f6f0dc', '#d4a63a');
+    // planters with greenery on the terrace edges (outside the field)
+    for (var pl = 0; pl < 2; pl++) { var px0 = pl ? W - g.m + 2 : 2, pw = g.m - 4; if (pw < 8) continue; for (var q = 0; q < pw / 5; q++) leaf(px0 + rnd() * pw, g.band - 2 - rnd() * 8); }
+    return c[0];
+  }
+  function short(v) { return v >= 10000 ? (v / 1000) + 'K' : fm(v); }
+
+  // ---------- paths (animation only: every destination is decided up front) ----------
+  function genFall(t, slot, t0, slow, xs) {
+    var g = G[t], segs = [], target = 2 * slot + 1, h = 2 * Math.floor(2 + vr.next() * 2.5 + vr.next() * 2.5) + 1, T0 = t0;
+    var ex = W / 2 + (vr.next() - 0.5) * g.dx * 2.2, d0 = 0.26 * slow * SP;
+    var jit = function () { return (vr.next() - 0.5) * g.dx * 0.08; };
+    var px = cx(t, h) + jit(), py = cy(t, 0);
+    segs.push({ k: 'fall', t0: T0, t1: T0 + d0, x0: ex, y0: wy(t, g.chuteY), x1: px, y1: wy(t, py), t: t }); T0 += d0;
+    for (var r = 0; r < R; r++) {
+      var n = R - r, d = target - h, dir;
+      if (h <= 1) dir = 1; else if (h >= 17) dir = -1; else dir = vr.next() < (n + d) / (2 * n) ? 1 : -1;
+      h += dir;
+      var last = r === R - 1, nx = last ? slotX(t, slot) + (vr.next() - 0.5) * g.dx * 0.35 : cx(t, h) + jit(), ny = last ? g.slotY : cy(t, r + 1);
+      var dur = (last ? 0.24 : 0.105 * (0.85 + vr.next() * 0.35)) * slow * SP, hop = g.dy * (0.12 + vr.next() * 0.32);
+      segs.push({ k: 'hop', t0: T0, t1: T0 + dur, x0: px, y0: wy(t, py), x1: nx, y1: wy(t, ny), hop: hop, t: t }); T0 += dur; px = nx; py = ny;
+    }
+    return { segs: segs, end: T0, x: px, y: wy(t, py) };
+  }
+  function buildTimeline(round) {
+    var balls = round.balls, tl = { balls: [], events: [], cam: [], stageStart: [], stageEnd: [], end: 0 };
+    balls.forEach(function () { tl.balls.push({ segs: [], i: 0 }); });
+    // stage 0: the waterfall — spawn times spread over ~2.3 s, denser in the middle
+    var sp = balls.map(function (b, i) { return Math.pow(vr.next(), 0.9) * 2.0 * SP; }).sort(function (a, b) { return a - b; });
+    var order = balls.map(function (_, i) { return i; }); for (var i = order.length - 1; i > 0; i--) { var j = Math.floor(vr.next() * (i + 1)), q = order[i]; order[i] = order[j]; order[j] = q; }
+    var stageEnd = 0, prevEnd = [];
+    order.forEach(function (bi, n) { var f = genFall(0, balls[bi].path[0], sp[n], 1); tl.balls[bi].segs = tl.balls[bi].segs.concat(f.segs); prevEnd[bi] = f;
+      var gate = balls[bi].path.length > 1; tl.events.push({ time: f.end, type: 'land', t: 0, s: balls[bi].path[0], b: bi, gate: gate, win: gate ? 0 : balls[bi].win, jp: !gate && balls[bi].kind === 'jp' }); stageEnd = Math.max(stageEnd, f.end); });
+    tl.stageStart[0] = 0; tl.stageEnd[0] = stageEnd; tl.cam.push({ t: 0, y: wy(0, 0) });
+    var L = 0.85 * SP;
+    for (var s = 1; s <= round.top; s++) {
+      var who = []; balls.forEach(function (b, bi) { if (b.path.length > s) who.push(bi); });
+      var st = tl.stageEnd[s - 1] + 0.3 * SP; tl.stageStart[s] = st;
+      tl.cam.push({ t: st, y: wy(s - 1, 0) }); tl.cam.push({ t: st + L, y: wy(s, 0) });
+      tl.events.push({ time: st, type: 'rise', t: s, n: who.length }); tl.events.push({ time: st + L * 0.85, type: 'tier', t: s, hint: round.hints[s] });
+      var end = 0;
+      who.forEach(function (bi, n) { var pe = prevEnd[bi], g = G[s];
+        tl.balls[bi].segs.push({ k: 'stay', t0: pe.end, t1: st, x0: pe.x, y0: pe.y, x1: pe.x, y1: pe.y, glow: 1 });
+        var tStart = st + L + 0.15 * SP + n * 0.38 * SP, ex = W / 2 + (n % 3 - 1) * g.dx * 0.6;
+        tl.balls[bi].segs.push({ k: 'lift', t0: st, t1: st + L, x0: pe.x, y0: pe.y, x1: ex, y1: wy(s, g.chuteY - 12), glow: 1 });
+        tl.balls[bi].segs.push({ k: 'stay', t0: st + L, t1: tStart, x0: ex, y0: wy(s, g.chuteY - 12), x1: ex, y1: wy(s, g.chuteY - 12), glow: 1 });
+        var f = genFall(s, balls[bi].path[s], tStart, 1.1); f.segs[0].x0 = ex; f.segs[0].y0 = wy(s, g.chuteY - 12);
+        tl.balls[bi].segs = tl.balls[bi].segs.concat(f.segs); prevEnd[bi] = f; end = Math.max(end, f.end);
+        var gate = balls[bi].path.length > s + 1; tl.events.push({ time: f.end, type: 'land', t: s, s: balls[bi].path[s], b: bi, gate: gate, win: gate ? 0 : balls[bi].win, jp: !gate && balls[bi].kind === 'jp' }); });
+      tl.stageEnd[s] = end;
+    }
+    var last = tl.stageEnd[round.top] + 0.35 * SP;
+    tl.events.push({ time: last, type: 'result' });
+    // the camera glides back to tier I after the round is settled (see camBack), so the result is not delayed by it
+    // sink: balls drop into their cup and vanish
+    tl.balls.forEach(function (b) { var lsg = b.segs[b.segs.length - 1]; b.segs.push({ k: 'sink', t0: lsg.t1, t1: lsg.t1 + 0.18, x0: lsg.x1, y0: lsg.y1, x1: lsg.x1, y1: lsg.y1 + 6 }); });
+    tl.events.sort(function (a, b) { return a.time - b.time; });
+    tl.end = last + (round.top > 0 ? 0.5 : 0.9) * SP;
+    return tl;
+  }
+  function rebuildAfterResize() { /* paths are in pixels: on resize mid-round just skip to the result */ skip(); }
+
+  // ---------- round flow ----------
+  var HINT_TXT = { blue: 'blue omen', red: 'red omen!', gold: 'GOLDEN OMEN!' }, tierFx = null;
+  var clock = 0, last = 0, ev = 0, flashes = [], floats = [], banner = null, hintState = [null, null, null, null], lit = [true, false, false, false], shownWin = 0;
+  function startRound() {
+    if (S.balance < C.BET) { toast('Not enough balance'); return; }
+    var boosted = S.kak > 0; if (boosted) S.kak--;
+    var round = PZ.playRound(rng, boosted, FORCE); FORCE = 0; S.rounds++;
+    var newKak = round.top >= 3 ? C.KAKUHEN.ROUNDS : S.kak;
+    S.balance -= C.BET; S.pending = { win: round.total, kak: newKak }; save();
+    round.newKak = newKak; round.tl = buildTimeline(round); S.round = round; S.lastRes = round;
+    camBack = null; clock = 0; ev = 0; flashes = []; floats = []; banner = null; hintState = [null, null, null, null]; lit = [true, false, false, false]; shownWin = 0; tierFx = null;
+    renderTop(S.balance, 0); setMode('play'); setBusy(true);
+  }
+  function finishRound() {
+    var r = S.round; S.balance += r.total; S.lastWin = r.total; S.kak = r.newKak; S.pending = null; save();
+    var cy0 = camY(); renderTop(); setMode('idle'); setBusy(false); S.round = null; S.lastShown = r;
+    if (r.top > 0) camBack = { y: cy0, t0: now() + 0.9, dur: 0.6 + 0.25 * r.top };
+    if (r.newKak > 0 && r.top >= 3) toast('Hanging Gardens bloom: better gates for ' + C.KAKUHEN.ROUNDS + ' rounds');
+  }
+  function skip() { if (!S.round) return; var tl = S.round.tl; clock = tl.end; processEvents(true); finishRound(); camBack = null; banner = { text: 'WIN ' + fm(S.lastWin), sub: S.lastShown.jp.length ? S.lastShown.jp.join(' + ') : '', t0: now(), dur: 1.6 }; }
+  function processEvents(silent) {
+    var tl = S.round.tl;
+    while (ev < tl.events.length && tl.events[ev].time <= clock) { var e = tl.events[ev++];
+      if (e.type === 'land') { if (!silent) flashes.push({ t: e.t, s: e.s, t0: now(), c: e.gate ? '#8fd0ff' : e.jp ? '#ffd36a' : e.win > 0 ? '#fff0b0' : null });
+        if (!e.gate) { shownWin += e.win; if (!silent && e.win > 0) floats.push({ x: slotX(e.t, e.s), y: wy(e.t, G[e.t].slotTop - 6), text: '+' + short(e.win), t0: now(), big: e.win >= 100 }); }
+        if (e.gate && !silent) floats.push({ x: slotX(e.t, e.s), y: wy(e.t, G[e.t].slotTop - 6) - 14 * floats.filter(function (f) { return f.gate && now() - f.t0 < 0.5; }).length, text: 'GATE', t0: now(), gate: true });
+        if (e.jp && !silent) banner = { text: C.JP[e.t].name, sub: '+' + fm(C.JP[e.t].x * C.BET), t0: now(), dur: 2.2, gold: true }; }
+      else if (e.type === 'rise') { if (!silent) banner = { text: e.n > 1 ? e.n + ' BALLS RISE' : 'A BALL RISES', sub: 'to tier ' + C.TIERS[e.t].name, t0: now(), dur: 1.1 }; }
+      else if (e.type === 'tier') { lit[e.t] = true; hintState[e.t] = e.hint; if (!silent) { tierFx = { t: e.t, t0: now() }; banner = { text: 'TIER ' + C.TIERS[e.t].name, sub: HINT_TXT[e.hint], t0: now(), dur: 1.3, tier: true }; } }
+      else if (e.type === 'result') { if (!silent) banner = { text: 'WIN ' + fm(S.round.total), sub: S.round.jp.length ? S.round.jp.join(' + ') : (S.round.top ? 'reached tier ' + C.TIERS[S.round.top].name : ''), t0: now(), dur: 1.5 * SP + 0.6 }; }
+    }
+    renderTop(S.balance, shownWin);
+  }
+  function now() { return performance.now() / 1000; }
+
+  // ---------- drawing ----------
+  var camBack = null;
+  function camY() {
+    if (!S.round) { if (!camBack) return wy(0, 0); var ub = (now() - camBack.t0) / camBack.dur; if (ub >= 1) { camBack = null; return wy(0, 0); } ub = Math.max(0, ub); ub = ub < 0.5 ? 2 * ub * ub : 1 - Math.pow(-2 * ub + 2, 2) / 2; return camBack.y + (wy(0, 0) - camBack.y) * ub; }
+    var k = S.round.tl.cam; if (clock <= k[0].t) return k[0].y;
+    for (var i = 1; i < k.length; i++) if (clock < k[i].t) { var a = k[i - 1], b = k[i], u = (clock - a.t) / Math.max(1e-6, b.t - a.t); u = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2; return a.y + (b.y - a.y) * u; }
+    return k[k.length - 1].y;
+  }
+  function posOf(sg, T) {
+    var u = Math.max(0, Math.min(1, (T - sg.t0) / Math.max(1e-6, sg.t1 - sg.t0)));
+    if (sg.k === 'fall') return [sg.x0 + (sg.x1 - sg.x0) * u, sg.y0 + (sg.y1 - sg.y0) * u * u];
+    if (sg.k === 'hop') return [sg.x0 + (sg.x1 - sg.x0) * (u * (2 - u) * 0.6 + u * 0.4), sg.y0 + (sg.y1 - sg.y0) * u * u - sg.hop * 4 * u * (1 - u)];
+    if (sg.k === 'lift') { var e = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2; return [sg.x0 + (sg.x1 - sg.x0) * e, sg.y0 + (sg.y1 - sg.y0) * e - Math.sin(u * Math.PI) * 30]; }
+    if (sg.k === 'sink') return [sg.x0, sg.y0 + (sg.y1 - sg.y0) * u];
+    return [sg.x0, sg.y0];
+  }
+  function draw() {
+    var cyv = camY(), tn = now();
+    ctx.clearRect(0, 0, W, H);
+    for (var t = 0; t < 4; t++) { var top = wy(t, 0) - cyv; if (top > H || top + H < 0) continue; ctx.drawImage(BG[t], 0, top, W, H);
+      drawHeader(t, top, tn);
+      if (S.kak > 0 && t === 0) { ctx.fillStyle = 'rgba(255,170,220,.85)'; var rr = seeded(5); for (var f = 0; f < 26; f++) { var fx = rr() < 0.5 ? rr() * G[0].m : W - rr() * G[0].m; ctx.beginPath(); ctx.arc(fx, top + rr() * H * 0.5, 1.8 + rr() * 1.5, 0, 7); ctx.fill(); } }
+      // gate / grand hint glow
+      var gi = C.TIERS[t].slots.indexOf(t < 3 ? 'G' : 'J'), hc = hintState[t];
+      if (hc) { var col = hc === 'gold' ? '255,210,90' : hc === 'red' ? '255,80,70' : '90,160,255', pul = 0.55 + 0.45 * Math.sin(tn * 7);
+        var gx = slotX(t, gi), gy = top + (G[t].slotTop + G[t].slotBot) / 2, rg = ctx.createRadialGradient(gx, gy, 2, gx, gy, G[t].dx * 1.4);
+        rg.addColorStop(0, 'rgba(' + col + ',' + (0.85 * pul) + ')'); rg.addColorStop(1, 'rgba(' + col + ',0)'); ctx.fillStyle = rg; ctx.fillRect(gx - G[t].dx * 1.5, gy - G[t].dx * 1.5, G[t].dx * 3, G[t].dx * 3); }
+      if (lit[t] && t > 0) { var la = 0.55 + 0.35 * Math.sin(tn * 4); ctx.strokeStyle = 'rgba(255,200,90,' + (la * 0.45) + ')'; ctx.lineWidth = 9; ctx.strokeRect(G[t].m + 4, top + G[t].head + 4, G[t].fw - 8, G[t].band - G[t].head - 8);
+        ctx.strokeStyle = 'rgba(255,240,180,' + la + ')'; ctx.lineWidth = 2.5; ctx.strokeRect(G[t].m + 3, top + G[t].head + 3, G[t].fw - 6, G[t].band - G[t].head - 6); }
+    }
+    // tier reached: golden wash and light rays from the top of the tier
+    if (tierFx) { var uf = (tn - tierFx.t0) / 1.6; if (uf >= 1) tierFx = null; else { var gt = G[tierFx.t], tp = wy(tierFx.t, 0) - cyv, af = uf < 0.12 ? uf / 0.12 : (1 - uf) / 0.88;
+      ctx.save(); ctx.globalAlpha = af * 0.5; ctx.fillStyle = '#ffd98a'; ctx.fillRect(gt.m, tp + gt.head, gt.fw, gt.band - gt.head);
+      ctx.globalAlpha = af * 0.35; ctx.fillStyle = '#fff4cc'; ctx.translate(W / 2, tp + gt.head * 0.4); ctx.rotate(uf * 0.6);
+      for (var ray = 0; ray < 10; ray++) { ctx.rotate(Math.PI / 5); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-W * 0.07, H); ctx.lineTo(W * 0.07, H); ctx.fill(); } ctx.restore(); } }
+    // slot flashes
+    flashes = flashes.filter(function (f) { var a = 1 - (tn - f.t0) / 0.45; if (a <= 0 || !f.c) return a > 0; var g = G[f.t]; ctx.globalAlpha = a * 0.55; ctx.fillStyle = f.c; ctx.fillRect(g.X0 + f.s * g.dx + 2, wy(f.t, g.slotTop) - cyv, g.dx - 4, g.slotBot - g.slotTop); ctx.globalAlpha = 1; return true; });
+    // balls
+    if (S.round) { var tl = S.round.tl, br = G[0].ballR;
+      for (var i = 0; i < tl.balls.length; i++) { var b = tl.balls[i], sg;
+        while (b.i < b.segs.length - 1 && b.segs[b.i].t1 < clock) b.i++;
+        sg = b.segs[b.i]; if (clock < b.segs[0].t0 || (sg.k === 'sink' && clock > sg.t1)) continue;
+        var p = posOf(sg, clock), y = p[1] - cyv; if (y < -20 || y > H + 20) continue;
+        if (sg.glow) { var gg = ctx.createRadialGradient(p[0], y, 1, p[0], y, br * 4); gg.addColorStop(0, 'rgba(160,210,255,.9)'); gg.addColorStop(1, 'rgba(160,210,255,0)'); ctx.fillStyle = gg; ctx.fillRect(p[0] - br * 4, y - br * 4, br * 8, br * 8); }
+        if (sg.k === 'sink') ctx.globalAlpha = 1 - (clock - sg.t0) / (sg.t1 - sg.t0);
+        ctx.drawImage(SPRITE, p[0] - br - 1, y - br - 1, br * 2 + 2, br * 2 + 2); ctx.globalAlpha = 1; } }
+    // floats
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    floats = floats.filter(function (f) { var u = (tn - f.t0) / 0.9; if (u >= 1) return false; ctx.globalAlpha = 1 - u * u; ctx.font = '800 ' + (f.big ? 16 : f.gate ? 11 : 12) + 'px Georgia';
+      ctx.fillStyle = f.gate ? '#9cd0ff' : '#ffe9a8'; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 3; var y = f.y - cyv - u * 26; ctx.strokeText(f.text, f.x, y); ctx.fillText(f.text, f.x, y); ctx.globalAlpha = 1; return true; });
+    // banner
+    if (banner) { var u2 = (tn - banner.t0) / banner.dur; if (u2 >= 1) banner = null; else { var a2 = u2 < 0.15 ? u2 / 0.15 : u2 > 0.8 ? (1 - u2) / 0.2 : 1, sc = 0.8 + 0.2 * Math.min(1, u2 / 0.15);
+      ctx.save(); ctx.globalAlpha = a2; ctx.translate(W / 2, H * 0.42); ctx.scale(sc, sc);
+      ctx.fillStyle = 'rgba(8,14,40,.72)'; var bw = Math.min(W * 0.86, 300); roundRect(-bw / 2, -34, bw, banner.sub ? 72 : 56, 6); ctx.fill(); ctx.strokeStyle = banner.gold ? '#ffd36a' : '#d4a63a'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.font = '800 ' + (banner.gold ? 30 : 26) + 'px Georgia'; ctx.fillStyle = banner.gold ? '#ffd36a' : '#ffe9a8'; ctx.fillText(banner.text, 0, -8);
+      if (banner.sub) { ctx.font = '600 14px Georgia'; ctx.fillStyle = '#e8dcc0'; ctx.fillText(banner.sub, 0, 20); } ctx.restore(); } }
+    // idle hint
+    if (!S.round && !banner) { ctx.globalAlpha = 0.55 + 0.35 * Math.sin(tn * 3); ctx.font = '700 13px Georgia'; ctx.fillStyle = '#ffe9a8'; ctx.textAlign = 'center'; ctx.fillText('TAP TO DROP 100 BALLS', W / 2, H * 0.135); ctx.globalAlpha = 1; }
+  }
+  function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+  function drawHeader(t, top, tn) {
+    var g = G[t], ty = top + g.head * 0.32; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.font = '800 ' + Math.min(15, g.head * 0.24) + 'px Georgia'; ctx.fillStyle = lit[t] ? '#ffe9a8' : 'rgba(255,233,168,.55)'; ctx.fillText('TIER ' + C.TIERS[t].name, g.m + 8, ty);
+    ctx.textAlign = 'center'; ctx.font = '700 ' + Math.min(12, g.head * 0.19) + 'px Georgia'; ctx.fillStyle = '#ffd36a'; ctx.fillText(C.JP[t].name + ' ' + fm(C.JP[t].x * C.BET), W / 2, ty);
+    // mini ziggurat: which tier is this / which tiers were reached
+    var bx = W - g.m - 22, by = top + g.head * 0.52;
+    for (var k = 0; k < 4; k++) { var w = 30 - k * 7, h = g.head * 0.09; ctx.fillStyle = k === t ? '#ffe08a' : lit[k] ? '#c9a24a' : 'rgba(255,255,255,.25)'; ctx.fillRect(bx - w / 2, by - (k + 1) * (h + 1.2), w, h); }
+  }
+  // ---------- loop & input ----------
+  function frame(ts) {
+    var t = ts / 1000, dt = Math.min(0.05, last ? t - last : 0); last = t;
+    if (S.round) { clock += dt; processEvents(false); if (clock >= S.round.tl.end) finishRound(); }
+    draw(); requestAnimationFrame(frame);
+  }
+  $('app').addEventListener('pointerdown', function (e) { if (e.button > 0) return; if (S.round) skip(); else startRound(); });
+  window.addEventListener('resize', function () { resize(); });
+  load(); resize(); renderTop(); setMode('idle'); setBusy(false); requestAnimationFrame(frame);
+  window.PZ_UI = { state: S };
+})();
+
+</script>
+</body>
+</html>
