@@ -1,0 +1,15 @@
+[
+{"name":"bg0","prompt":"ancient Babylon at night, base of a colossal ziggurat with blue glazed brick walls and golden torches, city walls, starry deep blue sky, crescent moon, painterly fantasy concept art, rich detail, vertical composition","w":512,"h":768,"steps":3,"n":3,"seed":10},
+{"name":"bg1","prompt":"terraces of an ancient Babylonian ziggurat at twilight, hanging gardens with palm trees and vines spilling over sandstone walls, violet sky with first stars, painterly fantasy concept art, rich detail, vertical composition","w":512,"h":768,"steps":3,"n":3,"seed":20},
+{"name":"bg2","prompt":"hanging gardens of Babylon at sunset, ziggurat terraces covered in lush greenery, waterfalls and flowers, orange and pink sky, painterly fantasy concept art, rich detail, vertical composition","w":512,"h":768,"steps":3,"n":3,"seed":30},
+{"name":"bg3","prompt":"summit of a golden ziggurat temple at sunrise above the clouds, radiant golden sky, god rays, divine light, painterly fantasy concept art, rich detail, vertical composition","w":512,"h":768,"steps":3,"n":3,"seed":40},
+{"name":"bricks","prompt":"flat frontal seamless texture of deep blue lapis lazuli glazed ceramic bricks wall, Ishtar gate, glossy tiles, even lighting, high detail","w":512,"h":512,"steps":3,"n":3,"seed":50},
+{"name":"dragon","prompt":"Ishtar gate mushhushshu dragon relief, golden serpent dragon with scales, horned head, lion forelegs and eagle hind legs, walking, on blue glazed bricks, flat frontal view, museum photo, highly detailed","w":768,"h":384,"steps":3,"n":3,"seed":60},
+{"name":"lion","prompt":"Ishtar gate relief, striding golden lion with mane on deep blue lapis lazuli glazed bricks, ancient Babylon, flat frontal view, highly detailed, museum photo","w":768,"h":384,"steps":3,"n":3,"seed":70},
+{"name":"goldtex","prompt":"ornate embossed gold metal texture, babylonian rosettes and palmettes pattern, polished gold relief, flat top view, high detail","w":512,"h":512,"steps":3,"n":2,"seed":80},
+{"name":"rosette","prompt":"single golden eight petal rosette medallion, babylonian, embossed polished gold with blue enamel center, centered on pure black background, game asset","w":512,"h":512,"steps":3,"n":3,"seed":90},
+{"name":"portal","prompt":"glowing magical portal of bright blue light inside an ornate golden babylonian arch doorway, energy swirl, centered, dark background, game asset","w":512,"h":768,"steps":3,"n":3,"seed":100},
+{"name":"plaque","prompt":"ornate golden babylonian nameplate frame with blue lapis lazuli inlay and red gems, wide horizontal cartouche, empty dark center, centered on pure black background, game ui asset","w":768,"h":384,"steps":3,"n":4,"seed":110},
+{"name":"vines","prompt":"hanging green ivy vines with pink and white flowers dangling from top, isolated on pure black background","w":768,"h":512,"steps":3,"n":3,"seed":120},
+{"name":"pillar","prompt":"carved sandstone pillar texture with babylonian ornaments and cuneiform, warm light, flat frontal view, high detail","w":384,"h":768,"steps":3,"n":2,"seed":130}
+]

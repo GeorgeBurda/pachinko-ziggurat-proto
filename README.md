@@ -2,7 +2,7 @@
 
 Live: https://georgeburda.github.io/pachinko-ziggurat-proto/
 
-A pachinko-style game with a Babylon / ziggurat theme, built for a portrait phone. The whole game is one self-contained `index.html` (canvas + vanilla JS, no images).
+A pachinko-style game with a Babylon / ziggurat theme, built for a portrait phone. `index.html` (canvas + vanilla JS) plus `assets/` (raster art, about 1 MB in total).
 
 ## Rules
 - **Tap** to play a round: **100 balls for 100 credits** (1 credit per ball). All balls drop at once as a waterfall. **Tap during the animation** to skip straight to the result.
@@ -44,3 +44,34 @@ A pachinko-style game with a Babylon / ziggurat theme, built for a portrait phon
 
 ## Test URL parameters
 `?seed=N` (repeatable RNG), `?tier=2|3|4` (force the next round to reach that tier), `?gardens=1` (start in Hanging Gardens), `?turbo=1` (faster animation). The balance is stored in localStorage (`pachinko_ziggurat_proto_v1`). If you reload during a round, its win is credited when the page loads again.
+
+## v2 art and effects
+- **Raster art** (`assets/*.webp`): generated locally with the open text-to-image model *stabilityai/sd-turbo* (prompts in `tools/prompts.json`), then cropped, keyed, recoloured and compressed with `tools/process.py`. It includes:
+  - painted backdrops for each tier: the ziggurat at night, twilight terraces, the Hanging Gardens at sunset, and a golden summit at dawn;
+  - Ishtar-gate lapis bricks;
+  - lion and mushhushshu dragon friezes;
+  - a gold filigree texture and carved sandstone;
+  - a rosette medallion;
+  - the gate portal;
+  - jackpot plaques: MINI turquoise, MINOR lapis, MAJOR crimson, GRAND royal purple;
+  - hanging vines with flowers.
+- **Sprites** (`tools/sprites.py`, rendered with numpy shading): chrome, lapis, gold and ruby balls (a ball changes material as it climbs tiers I to IV), gold peg studs and a coin.
+- **Font:** Cinzel and Cinzel Decorative (SIL OFL, bundled as subset woff2 in `assets/`).
+- **Effects:**
+  - motion trails, sparks off pegs, slot glow pops and value floaters;
+  - tier climb: light beam, eased camera pan, light screen shake, then the new tier ignites (dark veil lifts, flash, rays);
+  - omen glow on the gate or Grand slot (blue, red with rays, gold with fast rays);
+  - jackpot plaque flash;
+  - end-of-round celebrations, by round win:
+
+    | Win | Celebration |
+    |---|---|
+    | under 3× bet | normal |
+    | 3× bet or more | BIG |
+    | 10× bet or more | MEGA, with coin shower |
+    | any jackpot | jackpot plaque presentation, with coin shower |
+
+    Balance and win roll up together during the celebration.
+  - Hanging Gardens: vines and petals overgrow tier I;
+  - ambient dust motes and sun rays on the summit.
+- **Performance:** text, plates and balls are pre-rendered bitmaps, and the camera moves in whole device pixels. An adaptive quality governor steps down if frames are slow: trails, then peg sparks, then resolution 2× to 1.5×, then rays, then 1×. Dev parameters: `?q=0..5` forces a quality level, `?dpr=1.5` caps the resolution.
